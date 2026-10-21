@@ -16,6 +16,7 @@ from json import loads
 from lxml import etree
 from PIL import Image, ImageFilter
 from aip import AipBodyAnalysis
+from Lib.jellyfin_auth import requires_modern_auth, request_headers, api_url
 
 
 def fix_size(type, path):
@@ -152,8 +153,8 @@ def xslist_search(id, name):
         else:
             detial_json["Tags"] = ['AV女优']
 
-        url_post = host_url + 'Items/' + id + '?api_key=' + api_key
-        response = session.post(url_post, json=detial_json, proxies=host_proxies)
+        url_post = api_url(host_url, 'Items/' + id, api_key, modern_auth)
+        response = session.post(url_post, json=detial_json, proxies=host_proxies, headers=server_headers())
         logger.debug(name + '个人信息已上传，返回：' + response.text)
         return True
     except (KeyboardInterrupt, SystemExit):
@@ -316,7 +317,8 @@ def download_avatar(url, actor_name, proc_md5):
 @asyncc
 def input_avatar(url, data):
     try:
-        session.post(url, proxies=host_proxies, data=data, headers={"Content-Type": 'image/jpeg'})
+        session.post(url, proxies=host_proxies, data=data,
+                     headers=server_headers({"Content-Type": 'image/jpeg'}))
         logger.debug(url.replace(host_url, '').replace(api_key, '***') + ' 导入成功。')
     except:
         logger.warning(url.replace(host_url, '').replace(api_key, '***') + ' 导入失败。' + format_exc())
@@ -326,12 +328,12 @@ def input_avatar(url, data):
 
 @asyncc
 def del_avatar(id, name):
-    url_post_img = host_url + 'Items/' + id + '/Images/Primary?api_key=' + api_key
-    session.delete(url=url_post_img, proxies=host_proxies)
-    url_post_img = host_url + 'Items/' + id + '/Images/Backdrop?api_key=' + api_key
-    session.delete(url=url_post_img, proxies=host_proxies)
-    url_post_img = host_url + 'Items/' + id + '/Images/Thumb?api_key=' + api_key
-    session.delete(url=url_post_img, proxies=host_proxies)
+    url_post_img = api_url(host_url, 'Items/' + id + '/Images/Primary', api_key, modern_auth)
+    session.delete(url=url_post_img, proxies=host_proxies, headers=server_headers())
+    url_post_img = api_url(host_url, 'Items/' + id + '/Images/Backdrop', api_key, modern_auth)
+    session.delete(url=url_post_img, proxies=host_proxies, headers=server_headers())
+    url_post_img = api_url(host_url, 'Items/' + id + '/Images/Thumb', api_key, modern_auth)
+    session.delete(url=url_post_img, proxies=host_proxies, headers=server_headers())
     # 重组请求json
     detial_json = {
         "Name": name,
@@ -367,8 +369,8 @@ def del_avatar(id, name):
         "ProductionLocations": [],
         "Taglines": []
     }
-    url_post = host_url + 'Items/' + id + '?api_key=' + api_key
-    session.post(url_post, json=detial_json, proxies=host_proxies)
+    url_post = api_url(host_url, 'Items/' + id, api_key, modern_auth)
+    session.post(url_post, json=detial_json, proxies=host_proxies, headers=server_headers())
 
 
 def get_gfriends_link(name):
@@ -563,11 +565,34 @@ Version = '''
         sys.exit()
 
 
+def detect_auth_mode():
+    """检测服务器类型及版本，判断是否需要 Jellyfin 12+ 的新版认证。"""
+    rewriteable_word('>> 检测服务器版本...')
+    try:
+        response = session.get(host_url + 'System/Info/Public', proxies=host_proxies, timeout=10, verify=False)
+        server_info = loads(response.text)
+        product_name = server_info.get('ProductName')
+        server_version = server_info.get('Version')
+        modern = requires_modern_auth(product_name, server_version)
+        logger.info('服务器信息：%s %s，认证方式：%s' % (
+            product_name, server_version, '新版 Authorization 头' if modern else '旧版 api_key 参数'))
+        return modern
+    except:
+        logger.warning('服务器版本检测失败，沿用旧版认证：' + format_exc())
+        return False
+
+
+def server_headers(extra=None):
+    """仅用于媒体服务器请求，新版认证时附带 Authorization 头。"""
+    return request_headers(api_key, modern_auth, extra)
+
+
 def read_persons(host_url, api_key):
     rewriteable_word('>> 连接 Emby / Jellyfin 服务器...')
-    host_url_persons = host_url + 'Persons?api_key=' + api_key  # &PersonTypes=Actor
+    host_url_persons = api_url(host_url, 'Persons', api_key, modern_auth)  # &PersonTypes=Actor
     try:
-        rqs_emby = session.get(url=host_url_persons, proxies=host_proxies, timeout=60, verify=False)
+        rqs_emby = session.get(url=host_url_persons, proxies=host_proxies, timeout=60, verify=False,
+                               headers=server_headers())
     except requests.exceptions.ConnectionError:
         logger.error('连接 Emby / Jellyfin 服务器失败：' + host_url_persons + format_exc())
         print('× 连接 Emby / Jellyfin 服务器失败，请检查地址是否正确：', host_url_persons, '\n')
@@ -817,6 +842,9 @@ session.mount('https://',
               requests.adapters.HTTPAdapter(max_retries=max_retries, pool_connections=100, pool_maxsize=100))
 session.headers = {"User-Agent": 'Gfriends_Inputer/' + version.replace('v', '')}
 session.proxies = proxies
+
+# 检测服务器认证方式（Jellyfin 12.0 起默认禁用旧版 api_key 认证）
+modern_auth = detect_auth_mode()
 
 # 检查更新
 public_ip = None
@@ -1080,7 +1108,8 @@ try:
                 if not proc_flag or (proc_flag and not proc_md5 in proc_list):
                     with open(pic_path, 'rb') as pic_bit:
                         b6_pic = b64encode(pic_bit.read())
-                    url_post_img = host_url + 'Items/' + actor_dict[actorname] + '/Images/Primary?api_key=' + api_key
+                    url_post_img = api_url(host_url, 'Items/' + actor_dict[actorname] + '/Images/Primary', api_key,
+                                           modern_auth)
                     input_avatar(url_post_img, b6_pic)
                     if Get_Intro == 1:
                         bar.text(
